@@ -1,0 +1,6 @@
+faster-whisper
+gradio
+langid
+pydub
+numpy
+tqdm
