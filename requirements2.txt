@@ -1,0 +1,10 @@
+gradio>=4.36
+langid
+pydub
+numpy
+tqdm
+# Faster-Whisper path (CPU / NVIDIA)
+faster-whisper>=1.0.0
+# Apple Silicon GPU path (installed only on arm64 macOS)
+mlx; platform_system == "Darwin" and platform_machine == "arm64"
+mlx-whisper; platform_system == "Darwin" and platform_machine == "arm64"
