@@ -20,6 +20,7 @@ import gradio as gr
 import numpy as np
 from tqdm import tqdm
 from faster_whisper import WhisperModel
+import whisper
 import langid
 
 # -------------------------------
@@ -171,6 +172,27 @@ def transcribe_words(model: WhisperModel, audio_path: str, beam_size: int = 5):
                 e = float(seg.start + (i + 1) * step)
                 words.append({"start": s, "end": e, "text": tok})
     logger.info("model.transcribe finished, extracted %d words", len(words))
+    return words
+
+def transcribe_words_whisper(model, audio_path: str):
+    """
+    Use OpenAI PyTorch whisper to get segment-level timestamps and split into words.
+    """
+    logger.info("Calling PyTorch Whisper model.transcribe on %s", audio_path)
+    result = model.transcribe(audio_path)
+    words = []
+    for seg in result.get("segments", []):
+        text = seg.get("text", "").strip()
+        tokens = text.split()
+        if not tokens:
+            continue
+        dur = float(seg["end"] - seg["start"])
+        step = dur / len(tokens)
+        for i, tok in enumerate(tokens):
+            s = float(seg["start"] + i * step)
+            e = float(seg["start"] + (i + 1) * step)
+            words.append({"start": s, "end": e, "text": tok})
+    logger.info("PyTorch Whisper model.transcribe finished, extracted %d words", len(words))
     return words
 
 def build_mono_language_segments(words: List[Dict], allowed_langs: List[str]) -> List[Dict]:
@@ -443,12 +465,19 @@ def run_transcription(
         device = "cpu"
     compute = "float16" if device in ("cuda", "mps") else "int8"
     logger.info("Initializing WhisperModel size=%s device=%s compute=%s", model_size, device, compute)
-    model = WhisperModel(model_size, device=device, compute_type=compute)
-    logger.info("WhisperModel ready")
+    if device == "mps":
+        model = whisper.load_model(model_size, device=device)
+        logger.info("PyTorch Whisper model ready")
+    else:
+        model = WhisperModel(model_size, device=device, compute_type=compute)
+        logger.info("faster-whisper WhisperModel ready")
 
     status = "Transcribing (word-level) ..."
     yield status, [], ""
-    words = transcribe_words(model, src_audio_path, beam_size=beam_size)
+    if device == "mps":
+        words = transcribe_words_whisper(model, src_audio_path)
+    else:
+        words = transcribe_words(model, src_audio_path, beam_size=beam_size)
     logger.info("Transcription produced %d words", len(words))
 
     status = f"Detected {len(words)} words. Building mono-language segments..."
