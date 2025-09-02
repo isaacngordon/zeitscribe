@@ -17,6 +17,7 @@ FFmpeg is recommended to support diverse audio formats (install system-wide).
 """
 
 import os
+import logging
 import re
 import json
 import math
@@ -40,6 +41,10 @@ import langid
 # - torch (only to detect CUDA availability; not required)
 
 # -------------------------------
+# Logging setup
+# -------------------------------
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 # Platform / backend detection
 # -------------------------------
 IS_APPLE_SILICON = (platform.system() == "Darwin" and platform.machine() == "arm64")
@@ -435,18 +440,23 @@ def run_transcription(
     """
     Gradio generator: yields (status, list_of_chunk_paths, consolidated_html)
     """
+    logger.info("Starting transcription process.")
     if audio_file is None:
+        logger.warning("No audio file uploaded.")
         yield "Please upload an audio file.", [], ""
         return
 
     if not project_name.strip():
         project_name = "project"
+    logger.debug(f"Project name: {project_name}")
     project_slug = slugify(project_name)
+    logger.debug(f"Project slug: {project_slug}")
     root_dir = root_save_dir.strip() or "./outputs"
     session_root = os.path.abspath(root_dir)
     project_dir = os.path.join(session_root, project_slug)
     chunks_dir = os.path.join(project_dir, "chunks")
     ensure_dir(chunks_dir)
+    logger.info(f"Chunks directory ensured at: {chunks_dir}")
 
     primary_code = NAME_TO_CODE.get(primary_lang_name, "en")
     addtl_codes = [NAME_TO_CODE.get(n, None) for n in (addtl_lang_names or [])]
@@ -455,6 +465,7 @@ def run_transcription(
 
     # Copy audio to project dir for stable serving & archive
     src_audio_path = copy_source(audio_file, project_dir)
+    logger.info(f"Audio file copied to: {src_audio_path}")
 
     # Backend selection
     requested = (model_choice or "auto").lower()
@@ -464,6 +475,7 @@ def run_transcription(
 
     if use_mlx:
         status = "Using MLX backend on Apple Silicon GPU..."
+        logger.info(status)
         yield status, [], ""
         mlx_repo = "mlx-community/whisper-large-v3-mlx"
         if requested == "mlx-large-v3-turbo":
@@ -476,6 +488,8 @@ def run_transcription(
         words = transcribe_words_faster_whisper(src_audio_path, model_size=fw_model, beam_size=int(beam_size))
 
     status = f"Detected {len(words)} words. Building mono-language segments..."
+    logger.info(status)
+    logger.info(status)
     yield status, [], ""
     ml_segments = build_mono_language_segments(words, allowed)
 
@@ -494,10 +508,12 @@ def run_transcription(
         saved_paths.append(fpath)
         status_now = (f"Saved chunk {ch['index']+1}/{len(chunks)} → {os.path.basename(fpath)}")
         html_now = render_consolidated_html(ml_segments, primary_code, addtl_codes, src_audio_path)
+        logger.debug(status_now)
         yield status_now, [[p] for p in saved_paths], html_now
 
     status = f"Done. {len(saved_paths)} chunk files saved in {chunks_dir}"
     full_html = render_consolidated_html(ml_segments, primary_code, addtl_codes, src_audio_path)
+    logger.info(status)
     yield status, [[p] for p in saved_paths], full_html
 
 def build_ui():
