@@ -128,6 +128,17 @@ def transcribe_words(model: WhisperModel, audio_path: str, beam_size: int = 5):
     Use faster-whisper to get word-level timestamps.
     Returns list of word dicts: {"start": float, "end": float, "text": str}
     """
+    logger.info("Calling model.transcribe on %s", audio_path)
+
+    # Throttled progress callback – logs every ~5 s
+    last_cb = {"t": 0.0}
+
+    def _cb(progress: float):
+        now = time.time()
+        if now - last_cb["t"] >= 5:
+            logger.info("Transcribe progress: %.1f%%", progress * 100.0)
+            last_cb["t"] = now
+
     segments, info = model.transcribe(
         audio_path,
         task="transcribe",
@@ -135,6 +146,8 @@ def transcribe_words(model: WhisperModel, audio_path: str, beam_size: int = 5):
         vad_parameters=dict(min_silence_duration_ms=500),
         beam_size=beam_size,
         word_timestamps=True,
+        progress_callback=_cb,
+        progress_callback_period=0.25,
         language=None,  # auto-detect overall; we'll still re-ID per segment with langid
     )
     words = []
@@ -159,6 +172,7 @@ def transcribe_words(model: WhisperModel, audio_path: str, beam_size: int = 5):
                 s = float(seg.start + i * step)
                 e = float(seg.start + (i + 1) * step)
                 words.append({"start": s, "end": e, "text": tok})
+    logger.info("model.transcribe finished, extracted %d words", len(words))
     return words
 
 def build_mono_language_segments(words: List[Dict], allowed_langs: List[str]) -> List[Dict]:
