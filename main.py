@@ -146,8 +146,6 @@ def transcribe_words(model: WhisperModel, audio_path: str, beam_size: int = 5):
         vad_parameters=dict(min_silence_duration_ms=500),
         beam_size=beam_size,
         word_timestamps=True,
-        progress_callback=_cb,
-        progress_callback_period=0.25,
         language=None,  # auto-detect overall; we'll still re-ID per segment with langid
     )
     words = []
