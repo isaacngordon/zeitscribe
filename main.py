@@ -7,6 +7,14 @@ import string
 import unicodedata
 from datetime import datetime
 from typing import List, Dict, Tuple, Generator
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 import gradio as gr
 import numpy as np
@@ -382,6 +390,8 @@ def run_transcription(
     """
     Gradio handler: yields (status, list_of_chunk_paths, consolidated_html)
     """
+    logger.info("Started transcription: model_size=%s, chunk_len=%s, beam=%s, primary=%s, additional=%s, project=%s",
+                model_size, chunk_length_sec, beam_size, primary_lang_name, addtl_lang_names, project_name)
     if audio_file is None:
         yield "Please upload an audio file.", [], ""
         return
@@ -402,6 +412,7 @@ def run_transcription(
 
     # Copy audio to project dir for stable serving & archive
     src_audio_path = copy_source(audio_file, project_dir)
+    logger.info("Audio copied to %s", src_audio_path)
 
     # Model init
     status = f"Loading model '{model_size}'..."
@@ -416,15 +427,19 @@ def run_transcription(
         device = "cpu"
 
     compute = "float16" if device == "cuda" else "int8"
+    logger.info("Initializing WhisperModel size=%s device=%s compute=%s", model_size, device, compute)
     model = WhisperModel(model_size, device=device, compute_type=compute)
+    logger.info("WhisperModel ready")
 
     status = "Transcribing (word-level) ..."
     yield status, [], ""
     words = transcribe_words(model, src_audio_path, beam_size=beam_size)
+    logger.info("Transcription produced %d words", len(words))
 
     status = f"Detected {len(words)} words. Building mono-language segments..."
     yield status, [], ""
     ml_segments = build_mono_language_segments(words, allowed)
+    logger.info("Built %d mono-language segments", len(ml_segments))
 
     # Save consolidated transcript dump (optional)
     with open(os.path.join(project_dir, "transcript_segments.json"), "w", encoding="utf-8") as f:
@@ -440,12 +455,14 @@ def run_transcription(
     for ch in tqdm(chunks):
         fpath = save_chunk_json(ch, chunks_dir, base_name, src_audio_path)
         saved_paths.append(fpath)
+        logger.debug("Saved chunk json to %s", fpath)
         # stream partial progress to UI
         status_now = (f"Saved chunk {ch['index']+1}/{len(chunks)} → {os.path.basename(fpath)}")
         html_now = render_consolidated_html(ml_segments, primary_code, addtl_codes, src_audio_path)
         yield status_now, saved_paths, html_now
 
     status = f"Done. {len(saved_paths)} chunk files saved in {chunks_dir}"
+    logger.info("Transcription workflow complete: %d chunks saved in %s", len(saved_paths), chunks_dir)
     full_html = render_consolidated_html(ml_segments, primary_code, addtl_codes, src_audio_path)
     yield status, saved_paths, full_html
 
