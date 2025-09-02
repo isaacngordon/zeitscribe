@@ -431,15 +431,18 @@ def run_transcription(
     status = f"Loading model '{model_size}'..."
     yield status, [], ""
     # Prefer CPU int8 by default; auto-pick GPU if available
-    device = "cuda"
+    device = "cuda"  # default to CUDA if available
     try:
         import torch
-        if not torch.cuda.is_available():
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
             device = "cpu"
     except Exception:
         device = "cpu"
-
-    compute = "float16" if device == "cuda" else "int8"
+    compute = "float16" if device in ("cuda", "mps") else "int8"
     logger.info("Initializing WhisperModel size=%s device=%s compute=%s", model_size, device, compute)
     model = WhisperModel(model_size, device=device, compute_type=compute)
     logger.info("WhisperModel ready")
