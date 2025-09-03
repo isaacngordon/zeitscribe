@@ -30,6 +30,7 @@ import math
 import time
 import argparse
 from typing import List, Dict, Tuple, Optional
+from pydub import AudioSegment
 
 from minimal import (
     transcribe_words_mlx,
@@ -125,7 +126,20 @@ def time_weighted_accuracy(pred: List[Dict], truth: List[Dict]) -> Dict:
     }
 
 
-def run_file(audio_path: str, allowed_langs: List[str], backend: str) -> Dict:
+def segment_dbfs(seg_all: AudioSegment, start: float, end: float) -> float:
+    try:
+        w = seg_all[int(start*1000):int(end*1000)]
+        val = w.dBFS
+        if val is None:
+            return -100.0
+        if val == float('inf') or val == float('-inf'):
+            return -100.0 if val < 0 else 0.0
+        return float(val)
+    except Exception:
+        return -100.0
+
+
+def run_file(audio_path: str, allowed_langs: List[str], backend: str, silence_dbfs_thresh: float = -45.0) -> Dict:
     # Words via chosen backend
     words: List[Dict] = []
     if backend in ("mlx", "auto"):
@@ -158,6 +172,40 @@ def run_file(audio_path: str, allowed_langs: List[str], backend: str) -> Dict:
         avg_conf_speech = sum((s["end"] - s["start"]) * float(s.get("confidence", 0.0)) for s in segs if s["language"] not in ("silence",)) / speech_time
     coverage_ok = abs(total - dur) < 1e-3 and segs and abs(segs[0]["start"]) < 1e-6 and abs(segs[-1]["end"] - dur) < 1e-6
 
+    # Silence/speech mismatch metrics
+    audio_seg = AudioSegment.from_file(audio_path)
+    # Fast lookup: overlapping words
+    def has_words_in(seg):
+        s, e = float(seg["start"]), float(seg["end"])
+        for w in words:
+            ws = float(w.get("start", 0.0))
+            we = float(w.get("end", ws))
+            if we > s and ws < e:
+                return True
+        return False
+
+    silence_but_words = 0.0
+    silence_but_loud = 0.0
+    speech_but_quiet_and_empty = 0.0
+    for seg in segs:
+        s, e = float(seg["start"]), float(seg["end"])
+        dur_seg = max(0.0, e - s)
+        db = segment_dbfs(audio_seg, s, e)
+        is_sil = (seg.get("language") == "silence")
+        has_w = has_words_in(seg)
+        if is_sil:
+            if has_w:
+                silence_but_words += dur_seg
+            if db > silence_dbfs_thresh:
+                silence_but_loud += dur_seg
+        else:
+            if (not has_w) and db <= (silence_dbfs_thresh - 5.0):
+                speech_but_quiet_and_empty += dur_seg
+
+    sil_words_frac = (silence_but_words / dur) if dur > 0 else None
+    sil_loud_frac = (silence_but_loud / dur) if dur > 0 else None
+    speech_quiet_empty_frac = (speech_but_quiet_and_empty / dur) if dur > 0 else None
+
     metrics = {
         "file": audio_path,
         "duration": dur,
@@ -166,6 +214,10 @@ def run_file(audio_path: str, allowed_langs: List[str], backend: str) -> Dict:
         "speech_fraction": (speech_time / dur) if dur > 0 else None,
         "und_fraction": (und_time / dur) if dur > 0 else None,
         "avg_conf_speech": avg_conf_speech,
+        "silence_not_empty_frac": sil_words_frac,  # silence label but words present
+        "silence_loud_frac": sil_loud_frac,        # silence label but high energy
+        "speech_quiet_empty_frac": speech_quiet_empty_frac,  # speech label but no words and quiet
+        "silence_dbfs_threshold": silence_dbfs_thresh,
     }
 
     truth = load_truth_segments(audio_path)
@@ -191,6 +243,7 @@ def run_main(argv=None):
     parser.add_argument("--ext", nargs="*", default=[".wav", ".mp3", ".m4a", ".flac"], help="Extensions when input is a directory")
     parser.add_argument("--langs", nargs="+", default=["en", "he"], help="Allowed languages (codes)")
     parser.add_argument("--backend", choices=["auto","mlx","faster"], default="auto")
+    parser.add_argument("--silence-dbfs", type=float, default=-45.0, help="dBFS threshold above which a segment is considered loud/speech-like")
     args = parser.parse_args(argv)
 
     files = find_audio_files(args.input, args.ext)
@@ -205,13 +258,16 @@ def run_main(argv=None):
     all_metrics = []
     for i, fpath in enumerate(files, 1):
         print(f"[{i}/{len(files)}] {os.path.basename(fpath)}")
-        m = run_file(fpath, allowed_langs=args.langs, backend=args.backend)
+        m = run_file(fpath, allowed_langs=args.langs, backend=args.backend, silence_dbfs_thresh=args.silence_dbfs)
         all_metrics.append(m)
         # Print quick line
         msg = (
             f" dur={m['duration']:.2f}s cover={m['coverage_ok']} "
             f"segments={m['num_segments']} speech={m['speech_fraction']:.2f} "
-            f"und={m['und_fraction']:.2f} conf={m['avg_conf_speech']:.2f}"
+            f"und={m['und_fraction']:.2f} conf={m['avg_conf_speech']:.2f} "
+            f"sil-words={m['silence_not_empty_frac'] if m['silence_not_empty_frac'] is not None else '-'} "
+            f"sil-loud={m['silence_loud_frac'] if m['silence_loud_frac'] is not None else '-'} "
+            f"sp-quiet={m['speech_quiet_empty_frac'] if m['speech_quiet_empty_frac'] is not None else '-'}"
         )
         if 'acc_all' in m and m['acc_all'] is not None:
             msg += f" acc_all={m['acc_all']:.3f}"
@@ -224,6 +280,20 @@ def run_main(argv=None):
     def avg(key):
         vals = [m[key] for m in all_metrics if m.get(key) is not None]
         return (sum(vals) / len(vals)) if vals else None
+    # Weighted by duration helper
+    tot_dur = sum(m['duration'] for m in all_metrics if m.get('duration')) or 0.0
+    def wavg(key):
+        if tot_dur <= 0:
+            return None
+        s = 0.0
+        for m in all_metrics:
+            d = m.get('duration') or 0.0
+            v = m.get(key)
+            if v is None:
+                continue
+            s += v * d
+        return (s / tot_dur) if tot_dur > 0 else None
+
     summary = {
         "count": n,
         "coverage_ok_frac": sum(1 for m in all_metrics if m.get("coverage_ok")) / n,
@@ -233,6 +303,11 @@ def run_main(argv=None):
         "avg_conf_speech": avg("avg_conf_speech"),
         "avg_acc_all": avg("acc_all"),
         "avg_acc_speech": avg("acc_speech"),
+        # New mismatch metrics (time-weighted across files)
+        "silence_not_empty_frac": wavg("silence_not_empty_frac"),
+        "silence_loud_frac": wavg("silence_loud_frac"),
+        "speech_quiet_empty_frac": wavg("speech_quiet_empty_frac"),
+        "silence_dbfs_threshold": args.silence_dbfs,
     }
 
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -334,6 +409,9 @@ def analyze_all(root: str, outdir: Optional[str] = None, write_csv: bool = True)
         " avg_acc_speech=", fmt(grand["avg_acc_speech"]),
         " avg_speech_fraction=", fmt(grand["avg_speech_fraction"]),
         " avg_und_fraction=", fmt(grand["avg_und_fraction"]),
+        " sil_not_empty=", fmt(grand.get("silence_not_empty_frac")),
+        " sil_loud=", fmt(grand.get("silence_loud_frac")),
+        " sp_quiet_empty=", fmt(grand.get("speech_quiet_empty_frac")),
     )
     return 0
 
@@ -344,7 +422,37 @@ def analyze_main(argv=None):
     parser.add_argument("--out", default=None, help="Directory to write analysis outputs (defaults to <root>/analysis)")
     parser.add_argument("--no-csv", action="store_true", help="Do not write CSV files")
     args = parser.parse_args(argv)
-    return analyze_all(args.root, outdir=args.out, write_csv=(not args.no_csv))
+    # Perform analysis and also print regression (delta) between latest two runs if present
+    rc = analyze_all(args.root, outdir=args.out, write_csv=(not args.no_csv))
+    try:
+        run_dirs = sorted([d for d in os.listdir(args.root) if os.path.isdir(os.path.join(args.root, d))])
+        if len(run_dirs) >= 2:
+            latest = run_dirs[-1]
+            prev = run_dirs[-2]
+            def load_summary(run_id):
+                p = os.path.join(args.root, run_id, 'summary.json')
+                with open(p, 'r', encoding='utf-8') as f:
+                    return json.load(f).get('summary', {})
+            s_latest = load_summary(latest)
+            s_prev = load_summary(prev)
+            keys = [
+                'coverage_ok_frac', 'avg_acc_speech', 'avg_conf_speech',
+                'avg_speech_fraction', 'avg_und_fraction',
+                'silence_not_empty_frac', 'silence_loud_frac', 'speech_quiet_empty_frac',
+            ]
+            def fmt(v):
+                return '-' if v is None else (f"{v:.3f}" if isinstance(v, (int,float)) else str(v))
+            print("\nRegression (latest vs previous):")
+            for k in keys:
+                v1 = s_latest.get(k)
+                v0 = s_prev.get(k)
+                dv = None
+                if isinstance(v1, (int,float)) and isinstance(v0, (int,float)):
+                    dv = v1 - v0
+                print(f" {k}: latest={fmt(v1)} prev={fmt(v0)} delta={fmt(dv)}")
+    except Exception:
+        pass
+    return rc
 
 
 def main(argv=None):
