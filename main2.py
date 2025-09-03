@@ -28,7 +28,7 @@ import unicodedata
 import platform
 import html
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import gradio as gr
 import numpy as np
@@ -43,8 +43,26 @@ import langid
 # -------------------------------
 # Logging setup
 # -------------------------------
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Silence noisy third-party loggers
+for noisy in [
+    "faster_whisper",
+    "whisper",
+    "mlx",
+    "mlx_whisper",
+    "numba",
+    "torch",
+    "torchaudio",
+    "transformers",
+    "urllib3",
+]:
+    try:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    except Exception:
+        pass
 # Platform / backend detection
 # -------------------------------
 IS_APPLE_SILICON = (platform.system() == "Darwin" and platform.machine() == "arm64")
@@ -134,11 +152,45 @@ def setup_langid(allowed_langs: List[str]):
 
 def detect_lang(text: str, allowed_langs: List[str]) -> str:
     if not text.strip():
-        return allowed_langs[0] if allowed_langs else "und"
+        # Unknown; don't force-map to primary here
+        return "und"
     code, _ = langid.classify(text)
-    if allowed_langs and code not in allowed_langs:
-        return allowed_langs[0]
+    # Do not coerce to the primary language; return detected code
     return code
+
+def dominant_script_lang(text: str) -> str:
+    """Classify by script presence.
+    - If any Hebrew letters and no Latin → 'he'
+    - If any Latin letters and no Hebrew → 'en'
+    - If both present → pick by count
+    - Else 'und'
+    """
+    if not text:
+        return "und"
+    heb = 0
+    lat = 0
+    for ch in text:
+        o = ord(ch)
+        if 0x0590 <= o <= 0x05FF:
+            heb += 1
+        elif ('a' <= ch.lower() <= 'z'):
+            lat += 1
+    if heb == 0 and lat == 0:
+        return "und"
+    if heb > 0 and lat == 0:
+        return "he"
+    if lat > 0 and heb == 0:
+        return "en"
+    return "he" if heb >= lat else "en"
+
+def classify_word_lang(word: str, allowed_langs: List[str]) -> str:
+    # Prefer script-based detection for robustness with Whisper output
+    s_lang = dominant_script_lang(word)
+    if s_lang != "und":
+        # Trust script detection even if not in allowed list
+        return s_lang
+    # Fallback to langid for ambiguous tokens
+    return detect_lang(word, allowed_langs)
 
 # -------------------------------
 # Transcription paths
@@ -168,7 +220,14 @@ def transcribe_words_faster_whisper(audio_path: str, model_size: str, beam_size:
         language=None,
     )
     words = []
+    raw_text_parts = []
     for seg in segments:
+        try:
+            stxt = (seg.text or "").strip()
+            if stxt:
+                raw_text_parts.append(stxt)
+        except Exception:
+            pass
         if hasattr(seg, "words") and seg.words:
             for w in seg.words:
                 wt = (w.word or "").strip()
@@ -188,6 +247,9 @@ def transcribe_words_faster_whisper(audio_path: str, model_size: str, beam_size:
                 s = float(seg.start + i * step)
                 e = float(seg.start + (i + 1) * step)
                 words.append({"start": s, "end": e, "text": tok})
+    raw_text = " ".join(raw_text_parts).strip()
+    if raw_text:
+        logger.info(f"ASR (faster-whisper) raw text ({len(raw_text)} chars):\n{raw_text}")
     return words
 
 def transcribe_words_mlx(audio_path: str, mlx_model_repo: str = "mlx-community/whisper-large-v3-mlx"):
@@ -196,17 +258,46 @@ def transcribe_words_mlx(audio_path: str, mlx_model_repo: str = "mlx-community/w
     out = mlx_whisper.transcribe(
         audio_path,
         path_or_hf_repo=mlx_model_repo,
-        word_timestamps=True
+        word_timestamps=True,
+        task="transcribe",   # ensure original-language transcription, not translation
+        language=None,
     )
+    # High-level text from backend
+    backend_text = (out.get("text") or "").strip()
+    if backend_text:
+        logger.info(f"ASR (MLX) raw text ({len(backend_text)} chars):\n{backend_text}")
+
     words = []
     for seg in out.get("segments", []):
-        for w in seg.get("words", []):
-            t = (w.get("word") or "").strip()
-            if t:
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", seg_start))
+        seg_words = seg.get("words", []) or []
+
+        if seg_words:
+            # Use provided word timestamps when available
+            for w in seg_words:
+                t = (w.get("word") or "").strip()
+                if t:
+                    words.append({
+                        "start": float(w.get("start", seg_start)),
+                        "end": float(w.get("end", seg_end)),
+                        "text": t
+                    })
+        else:
+            # Fallback: segment-level text without word timings
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            tokens = text.split()
+            dur = max(0.0, seg_end - seg_start)
+            step = dur / len(tokens) if tokens else dur
+            for i, tok in enumerate(tokens):
+                s = seg_start + i * step
+                e = seg_start + (i + 1) * step
                 words.append({
-                    "start": float(w.get("start", seg.get("start", 0.0))),
-                    "end": float(w.get("end", seg.get("end", 0.0))),
-                    "text": t
+                    "start": float(s),
+                    "end": float(e),
+                    "text": tok
                 })
     return words
 
@@ -216,55 +307,105 @@ def transcribe_words_mlx(audio_path: str, mlx_model_repo: str = "mlx-community/w
 
 def build_mono_language_segments(words: List[Dict], allowed_langs: List[str]) -> List[Dict]:
     """
-    Group contiguous words predicted to be the same language into segments:
-    Each: {"start": float, "end": float, "body": str, "language": "<code>"}
+    Build segments by assigning a language to each word (script-first, then langid),
+    then grouping contiguous words with same language. Also split on large time gaps
+    (likely pauses between speaker and translator).
+
+    Output segments: {start, end, body, language}
     """
     setup_langid(allowed_langs)
-    segments = []
-    curr = None
+    if not words:
+        return []
 
-    phrase_words = []
-    phrase_start = None
-    max_phrase_span = 1.2  # seconds
+    # Parameters tuned for alternating lecturer/translator speech
+    max_gap_sec = 0.8   # split if silence/gap exceeds this
+    min_segment_sec = 0.8  # avoid tiny fragments; merge with neighbors when possible
 
-    def flush_phrase():
-        nonlocal phrase_words, phrase_start, curr, segments
-        if not phrase_words:
+    segments: List[Dict] = []
+    curr_lang = None
+    curr_start = None
+    curr_end = None
+    curr_tokens: List[str] = []
+    curr_words: List[Dict] = []
+
+    def push_segment():
+        nonlocal curr_start, curr_end, curr_tokens, curr_lang, curr_words
+        if curr_start is None or curr_end is None or not curr_tokens or not curr_lang:
+            # reset
+            curr_start, curr_end, curr_tokens, curr_lang, curr_words = None, None, [], None, []
             return
-        text = " ".join(w["text"] for w in phrase_words).strip()
-        p_start = phrase_start
-        p_end = phrase_words[-1]["end"]
-        lang = detect_lang(text, allowed_langs) or (allowed_langs[0] if allowed_langs else "und")
+        body = " ".join(curr_tokens).strip()
+        if not body:
+            curr_start, curr_end, curr_tokens, curr_lang, curr_words = None, None, [], None, []
+            return
+        segments.append({
+            "start": float(curr_start),
+            "end": float(curr_end),
+            "body": body,
+            "language": curr_lang,
+            "words": list(curr_words),
+        })
+        curr_start, curr_end, curr_tokens, curr_lang, curr_words = None, None, [], None, []
 
-        if curr is None:
-            curr = {"start": p_start, "end": p_end, "body": text, "language": lang}
-        else:
-            if curr["language"] == lang:
-                curr["end"] = p_end
-                curr["body"] = (curr["body"] + " " + text).strip()
-            else:
-                segments.append(curr)
-                curr = {"start": p_start, "end": p_end, "body": text, "language": lang}
-        phrase_words = []
-        phrase_start = None
-
+    prev_end = None
     for w in words:
-        if phrase_start is None:
-            phrase_start = w["start"]
-        phrase_words.append(w)
-        if (w["end"] - phrase_start) >= max_phrase_span:
-            flush_phrase()
+        w_text = (w.get("text") or "").strip()
+        if not w_text:
+            continue
+        w_start = float(w.get("start", 0.0))
+        w_end = float(w.get("end", w_start))
 
-    flush_phrase()
-    if curr is not None:
-        segments.append(curr)
+        # split on large gaps
+        if prev_end is not None and (w_start - prev_end) > max_gap_sec:
+            push_segment()
 
-    # Clean small overlaps
-    for i in range(1, len(segments)):
-        if segments[i]["start"] < segments[i-1]["end"]:
-            segments[i]["start"] = segments[i-1]["end"]
+        w_lang = classify_word_lang(w_text, allowed_langs)
 
-    return segments
+        if curr_lang is None:
+            curr_lang = w_lang
+            curr_start = w_start
+            curr_end = w_end
+            curr_tokens = [w_text]
+            curr_words = [{"start": w_start, "end": w_end, "text": w_text}]
+        else:
+            if w_lang == curr_lang:
+                curr_end = w_end
+                curr_tokens.append(w_text)
+                curr_words.append({"start": w_start, "end": w_end, "text": w_text})
+            else:
+                # Language flip → push previous and start new
+                push_segment()
+                curr_lang = w_lang
+                curr_start = w_start
+                curr_end = w_end
+                curr_tokens = [w_text]
+                curr_words = [{"start": w_start, "end": w_end, "text": w_text}]
+
+        prev_end = w_end
+
+    push_segment()
+
+    # Post-process: merge contiguous same-language segments only (never across languages)
+    merged: List[Dict] = []
+    for seg in segments:
+        if not merged:
+            merged.append(seg)
+            continue
+        if seg["language"] == merged[-1]["language"]:
+            # contiguous same-language → merge
+            merged[-1]["end"] = seg["end"]
+            merged[-1]["body"] = (merged[-1]["body"] + " " + seg["body"]).strip()
+            if "words" in merged[-1] and "words" in seg:
+                merged[-1]["words"].extend(seg["words"])  # keep words for window clipping
+        else:
+            merged.append(seg)
+
+    # Ensure non-overlapping ordering
+    for i in range(1, len(merged)):
+        if merged[i]["start"] < merged[i-1]["end"]:
+            merged[i]["start"] = merged[i-1]["end"]
+
+    return merged
 
 # -------------------------------
 # Chunking and saving
@@ -282,10 +423,36 @@ def split_into_chunks(segments: List[Dict], chunk_sec: float) -> List[Dict]:
         win_end = min((idx + 1) * chunk_sec, end_time)
         segs_in = []
         for seg in segments:
-            if seg["end"] > win_start and seg["start"] < win_end:
+            if seg["end"] <= win_start or seg["start"] >= win_end:
+                continue
+            # Prefer clipping by words if available
+            if "words" in seg and seg["words"]:
+                win_words = [w for w in seg["words"] if w["end"] > win_start and w["start"] < win_end]
+                if not win_words:
+                    continue
+                # keep order as in original
+                win_words.sort(key=lambda w: (w["start"], w["end"]))
+                s = max(win_words[0]["start"], win_start)
+                e = min(win_words[-1]["end"], win_end)
+                body = " ".join((w.get("text") or "").strip() for w in win_words if (w.get("text") or "").strip()).strip()
+                if not body:
+                    continue
+                segs_in.append({
+                    "start": float(s),
+                    "end": float(e),
+                    "body": body,
+                    "language": seg["language"],
+                })
+            else:
+                # Fallback: time-clip only; body unchanged (may repeat across chunks)
                 s = max(seg["start"], win_start)
                 e = min(seg["end"], win_end)
-                segs_in.append({"start": s, "end": e, "body": seg["body"], "language": seg["language"]})
+                segs_in.append({
+                    "start": float(s),
+                    "end": float(e),
+                    "body": seg["body"],
+                    "language": seg["language"],
+                })
 
         length_words = sum(words_count(s["body"]) for s in segs_in)
         chunks.append({
@@ -489,9 +656,15 @@ def run_transcription(
 
     status = f"Detected {len(words)} words. Building mono-language segments..."
     logger.info(status)
-    logger.info(status)
     yield status, [], ""
     ml_segments = build_mono_language_segments(words, allowed)
+    # Log language distribution (concise)
+    try:
+        from collections import Counter
+        lang_counts = Counter(seg.get("language","und") for seg in ml_segments)
+        logger.info(f"Segment languages: {dict(lang_counts)} (total {len(ml_segments)})")
+    except Exception:
+        pass
 
     # Save consolidated raw segments (optional convenience file)
     with open(os.path.join(project_dir, "transcript_segments.json"), "w", encoding="utf-8") as f:
@@ -508,7 +681,8 @@ def run_transcription(
         saved_paths.append(fpath)
         status_now = (f"Saved chunk {ch['index']+1}/{len(chunks)} → {os.path.basename(fpath)}")
         html_now = render_consolidated_html(ml_segments, primary_code, addtl_codes, src_audio_path)
-        logger.debug(status_now)
+        # Keep console concise: only show the per-chunk save at INFO
+        logger.info(status_now)
         yield status_now, [[p] for p in saved_paths], html_now
 
     status = f"Done. {len(saved_paths)} chunk files saved in {chunks_dir}"
