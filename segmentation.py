@@ -310,10 +310,24 @@ class Transcriber:
 
         if self.backend == "mlx-whisper":
             try:
-                result = self._mlx_transcribe(self.model, audio=wav_path, language=language, task="transcribe")
-            except TypeError:
-                # Some versions may use positional args
-                result = self._mlx_transcribe(self.model, wav_path, language, "transcribe")
+                # mlx-whisper may expose transcribe as either a bound method on the model
+                # instance (model.transcribe(...)) or as a module-level function that
+                # expects the model as the first argument (mlx_whisper.transcribe(model, ...)).
+                # Prefer the bound method to avoid passing the model twice.
+                if hasattr(self.model, "transcribe") and callable(getattr(self.model, "transcribe")):
+                    result = self.model.transcribe(wav_path, language=language, task="transcribe")
+                elif callable(self._mlx_transcribe):
+                    # Try common module-level signatures
+                    try:
+                        result = self._mlx_transcribe(self.model, audio=wav_path, language=language, task="transcribe")
+                    except TypeError:
+                        result = self._mlx_transcribe(self.model, wav_path, language, "transcribe")
+                else:
+                    raise RuntimeError("mlx_whisper transcribe API not found")
+
+            except Exception as e:
+                # Let caller handle the warning; re-raise so upstream warning shows the real error
+                raise
 
             text = ""
             if isinstance(result, dict):
@@ -441,20 +455,82 @@ def main() -> int:
 
     transcriber = None
     if not args.no_transcribe and args.backend != "none":
-        transcriber = Transcriber(model_size=args.model)
-        # If user specified a concrete backend, but auto-detected differs, warn lightly
-        if args.backend in ("mlx", "faster", "openai") and transcriber.backend != f"{args.backend}-whisper" and transcriber.backend != args.backend:
-            # Try to force a specific backend by re-initializing in a minimal way
+        # If user requested a specific backend, try to initialize that backend explicitly.
+        def _try_init_mlx(model_size: str):
             try:
-                if args.backend == "mlx" and _have("mlx_whisper"):
-                    import mlx_whisper  # type: ignore
+                if not _have("mlx_whisper"):
+                    return None, None
+                import mlx_whisper  # type: ignore
+
+                load_model = getattr(mlx_whisper, "load_model", None)
+                transcribe_fn = getattr(mlx_whisper, "transcribe", None)
+                if callable(load_model):
+                    try:
+                        model = load_model(model_size)
+                    except Exception:
+                        alt_name = f"mlx-community/whisper-{model_size}"
+                        model = load_model(alt_name)
+                    return model, transcribe_fn
+
+                # Some versions may expose a model class on the module
+                ModelCls = getattr(mlx_whisper, "WhisperModel", None) or getattr(mlx_whisper, "Whisper", None)
+                if ModelCls:
+                    model = ModelCls(model_size)
+                    return model, getattr(model, "transcribe", None)
+
+            except Exception as e:
+                warnings.warn(f"Failed to init mlx-whisper explicitly: {e}")
+            return None, None
+
+        if args.backend == "auto":
+            transcriber = Transcriber(model_size=args.model)
+        else:
+            # Try to honour the requested backend
+            if args.backend == "mlx":
+                model_obj, trans_fn = _try_init_mlx(args.model)
+                if model_obj is not None:
+                    transcriber = Transcriber(model_size=args.model)
                     transcriber.backend = "mlx-whisper"
-                elif args.backend == "faster" and _have("faster_whisper"):
-                    transcriber.backend = "faster-whisper"
-                elif args.backend == "openai" and _have("whisper"):
-                    transcriber.backend = "openai-whisper"
-            except Exception:
-                pass
+                    transcriber.model = model_obj
+                    if trans_fn is not None:
+                        transcriber._mlx_transcribe = trans_fn
+                else:
+                    # Fall back to generic initializer which will try other backends
+                    transcriber = Transcriber(model_size=args.model)
+
+            elif args.backend == "faster":
+                if _have("faster_whisper"):
+                    try:
+                        from faster_whisper import WhisperModel  # type: ignore
+                        device = os.environ.get("WHISPER_DEVICE", "cpu")
+                        compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+                        model = WhisperModel(args.model, device=device, compute_type=compute_type)
+                        transcriber = Transcriber(model_size=args.model)
+                        transcriber.backend = "faster-whisper"
+                        transcriber.model = model
+                    except Exception as e:
+                        warnings.warn(f"Failed to init faster-whisper explicitly: {e}")
+                        transcriber = Transcriber(model_size=args.model)
+                else:
+                    transcriber = Transcriber(model_size=args.model)
+
+            elif args.backend == "openai":
+                if _have("whisper"):
+                    try:
+                        import whisper  # type: ignore
+                        model = whisper.load_model(args.model)
+                        transcriber = Transcriber(model_size=args.model)
+                        transcriber.backend = "openai-whisper"
+                        transcriber.model = model
+                    except Exception as e:
+                        warnings.warn(f"Failed to init openai-whisper explicitly: {e}")
+                        transcriber = Transcriber(model_size=args.model)
+                else:
+                    transcriber = Transcriber(model_size=args.model)
+
+            else:
+                # Unknown explicit backend; fall back to auto behavior
+                transcriber = Transcriber(model_size=args.model)
 
     if not args.no_transcribe and args.backend != "none" and (transcriber is None or not transcriber.available()):
         print(
