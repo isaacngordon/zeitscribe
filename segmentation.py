@@ -233,6 +233,219 @@ def energy_vad(
     return out
 
 
+# New: audio analysis utility to help pick thresholds and min-speech settings
+def analyze_audio(y: List[float], sr: int, frame_ms: float = 30.0, hop_ms: float = 10.0, width: int = 120, audio_path: Optional[str] = None) -> None:
+    import numpy as np
+    import math
+
+    x = np.asarray(y, dtype=np.float32)
+    if x.size == 0:
+        print("Empty audio.")
+        return
+
+    frame_len = int(sr * frame_ms / 1000.0)
+    hop_len = int(sr * hop_ms / 1000.0)
+    if frame_len <= 0:
+        frame_len = 1
+    if hop_len <= 0:
+        hop_len = 1
+
+    num_frames = 1 + max(0, (len(x) - frame_len) // hop_len)
+    if num_frames <= 0:
+        num_frames = 1
+    frames = np.lib.stride_tricks.as_strided(
+        x,
+        shape=(num_frames, frame_len),
+        strides=(x.strides[0] * hop_len, x.strides[0]),
+        writeable=False,
+    )
+    energy_db = np.log10((frames ** 2).mean(axis=1) + 1e-10) * 10.0
+
+    # Basic stats
+    mean = float(np.mean(energy_db))
+    median = float(np.median(energy_db))
+    std = float(np.std(energy_db))
+    p10, p25, p50, p75, p90 = [float(np.percentile(energy_db, p)) for p in (10, 25, 50, 75, 90)]
+
+    duration = len(x) / float(sr)
+    print(f"Duration: {duration:.2f}s | Frames: {len(energy_db)} | frame_ms={frame_ms} hop_ms={hop_ms}")
+    print("Energy (dB-ish): mean={:.2f}  median={:.2f}  std={:.2f}".format(mean, median, std))
+    print("Percentiles: 10%={:.2f}, 25%={:.2f}, 50%={:.2f}, 75%={:.2f}, 90%={:.2f}".format(p10, p25, p50, p75, p90))
+
+    # Suggested simple thresholds
+    suggestions = {
+        "median-3": median - 3.0,
+        "median-6": median - 6.0,
+        "p25": p25,
+        "p10": p10,
+        "default(-35)": -35.0,
+    }
+
+    # Compute an Otsu-like threshold on energy to separate background/signal if possible
+    def otsu_threshold(vals, bins=256):
+        hist, edges = np.histogram(vals, bins=bins)
+        hist = hist.astype(float)
+        total = hist.sum()
+        if total == 0:
+            return float(np.median(vals))
+        cum = np.cumsum(hist)
+        cum_mean = np.cumsum(hist * (0.5 * (edges[:-1] + edges[1:])))
+        sigma_b_max = -1.0
+        best = edges[0]
+        for i in range(len(hist)):
+            if cum[i] == 0 or (total - cum[i]) == 0:
+                continue
+            mean1 = cum_mean[i] / cum[i]
+            mean2 = (cum_mean[-1] - cum_mean[i]) / (total - cum[i])
+            sigma_b = cum[i] * (total - cum[i]) * (mean1 - mean2) ** 2
+            if sigma_b > sigma_b_max:
+                sigma_b_max = sigma_b
+                best = edges[i]
+        return float(best)
+
+    otsu = otsu_threshold(energy_db, bins=128)
+    suggestions["otsu"] = otsu
+
+    print("\nSuggested threshold candidates (dB-ish):")
+    for k, v in suggestions.items():
+        print(f"  {k:12s}: {v:.2f}")
+
+    # Histogram
+    bins = 60
+    hist, edges = np.histogram(energy_db, bins=bins)
+    max_count = hist.max() if hist.size else 1
+    print("\nEnergy histogram:")
+    for i in range(bins):
+        left = edges[i]
+        right = edges[i + 1]
+        bar = "#" * int(round((hist[i] / max_count) * 50))
+        print(f" {left:7.2f} -> {right:7.2f} | {bar}")
+
+    # Sparkline over time
+    print("\nEnergy over time (sparkline):")
+    N = width
+    if len(energy_db) < N:
+        samples = energy_db
+        sample_idx = np.arange(len(energy_db))
+    else:
+        sample_idx = np.linspace(0, len(energy_db) - 1, N).astype(int)
+        samples = energy_db[sample_idx]
+
+    chars = ' .:-=+*#%@'
+    lo = float(np.min(energy_db))
+    hi = float(np.max(energy_db))
+    rng = hi - lo if hi > lo else 1.0
+    line = ''.join(chars[int((s - lo) / rng * (len(chars) - 1))] for s in samples)
+    print(line)
+
+    # For a few candidate thresholds, compute voiced segment duration stats to help pick min_speech_ms
+    print("\nSegment duration stats for candidate thresholds (useful for --min-speech-ms):")
+    def seg_durations_for_thr(thr: float):
+        voiced = energy_db > thr
+        durations = []
+        cur_frames = 0
+        starts = []
+        ends = []
+        for i, v in enumerate(voiced):
+            if v:
+                if cur_frames == 0:
+                    starts.append(i)
+                cur_frames += 1
+            else:
+                if cur_frames > 0:
+                    durations.append(cur_frames * hop_ms)
+                    ends.append(i - 1)
+                    cur_frames = 0
+        if cur_frames > 0:
+            durations.append(cur_frames * hop_ms)
+            ends.append(len(voiced) - 1)
+        return durations, starts, ends
+
+    def summarize_durations(durations):
+        if not durations:
+            return (0, 0.0, 0.0, 0.0)
+        arr = np.array(durations)
+        return (len(arr), float(np.median(arr)), float(np.percentile(arr, 75)), float(np.percentile(arr, 90)))
+
+    for name, thr in suggestions.items():
+        durations, starts, ends = seg_durations_for_thr(thr)
+        cnt, med_ms, p75_ms, p90_ms = summarize_durations(durations)
+        coverage = (sum(durations) / (duration * 1000.0)) * 100.0 if duration > 0 else 0.0
+        print(f"  {name:12s}: segments={cnt:4d}  median_ms={med_ms:6.1f}  75%_ms={p75_ms:6.1f}  90%_ms={p90_ms:6.1f}  coverage={coverage:5.1f}%")
+
+    # SNR estimate: separate below/above median
+    bg = energy_db[energy_db <= median]
+    sig = energy_db[energy_db > median]
+    if sig.size > 0 and bg.size > 0:
+        snr_est = float(np.mean(sig)) - float(np.mean(bg))
+    else:
+        snr_est = 0.0
+    print(f"\nEstimated SNR (mean(signal)-mean(background)) ~= {snr_est:.2f} dB-ish")
+
+    # Suggest min_speech_ms and pad_ms based on observed durations
+    # Use p25/p50/p75 of voiced durations at otsu threshold
+    dur_otsu, starts_otsu, ends_otsu = seg_durations_for_thr(otsu)
+    cnt_otsu, med_otsu, p75_otsu, p90_otsu = summarize_durations(dur_otsu)
+    # Use 50% of 75th percentile or median as a reasonable min speech length
+    suggested_min_speech_ms = float(max(50.0, min(1000.0, (p75_otsu * 0.5) if p75_otsu > 0 else med_otsu)))
+    # pad: half of median silence length between voiced regions at otsu
+    silence_lengths = []
+    if starts_otsu:
+        prev_end = -1
+        for s, e in zip(starts_otsu, ends_otsu):
+            if prev_end >= 0:
+                gap_frames = s - prev_end - 1
+                if gap_frames > 0:
+                    silence_lengths.append(gap_frames * hop_ms)
+            prev_end = e
+    median_silence = float(np.median(silence_lengths)) if silence_lengths else 0.0
+    suggested_pad_ms = float(min(500.0, max(0.0, median_silence * 0.5)))
+
+    print(f"\nSuggested min_speech_ms ~ {suggested_min_speech_ms:.0f} ms  (based on Otsu segments)")
+    print(f"Suggested pad_ms        ~ {suggested_pad_ms:.0f} ms  (approx half median silence between segments)")
+
+    # Top longest voiced segments at Otsu
+    if dur_otsu:
+        durations_sorted = sorted([(d, s, e) for d, s, e in zip(dur_otsu, starts_otsu, ends_otsu)], reverse=True)
+        print("\nTop longest voiced regions (Otsu threshold):")
+        for i, (d, s, e) in enumerate(durations_sorted[:10], 1):
+            t0 = s * hop_ms / 1000.0
+            t1 = (e * hop_ms + frame_ms) / 1000.0
+            print(f"  {i:2d}. {t0:6.2f}s -> {t1:6.2f}s  duration={d:6.1f}ms")
+
+    # ASCII timeline overlay: mark positions above Otsu threshold
+    print("\nASCII timeline (", width, "cols) — '.' low .. '#' high; '|' marks Otsu-voiced")
+    chars = ' .:-=+*#%@'
+    lo = float(np.min(energy_db))
+    hi = float(np.max(energy_db))
+    rng = hi - lo if hi > lo else 1.0
+    timeline = []
+    for j in range(width):
+        idx = int(j * (len(energy_db) - 1) / (width - 1)) if width > 1 else 0
+        v = energy_db[idx]
+        ch = chars[int((v - lo) / rng * (len(chars) - 1))]
+        timeline.append(ch)
+    # overlay voiced markers
+    voiced_bool = energy_db > otsu
+    # map voiced frames to timeline positions
+    pos_voiced = set()
+    for i, vb in enumerate(voiced_bool):
+        if vb:
+            pos = int(i * (width - 1) / max(1, len(energy_db) - 1))
+            pos_voiced.add(pos)
+    line = ''.join('|' if i in pos_voiced else timeline[i] for i in range(len(timeline)))
+    print(line)
+
+    # Final runnable recommendation command (last line)
+    audio_arg = f'"{audio_path}"' if audio_path else '"/path/to/audio"'
+    cmd = (
+        f"python segmentation.py {audio_arg} --threshold-db {otsu:.2f}"
+        f" --min-speech-ms {int(round(suggested_min_speech_ms))} --pad-ms {int(round(suggested_pad_ms))}"
+        f" --frame-ms {int(round(frame_ms))} --hop-ms {int(round(hop_ms))}"
+    )
+    print(cmd)
+
+
 # ------------------------------
 # Transcription backends (Whisper)
 # ------------------------------
@@ -420,6 +633,7 @@ def main() -> int:
     parser.add_argument("--min-speech-ms", type=float, default=300.0, help="Minimum speech duration in ms")
     parser.add_argument("--min-silence-ms", type=float, default=250.0, help="Minimum silence between segments to split, in ms")
     parser.add_argument("--pad-ms", type=float, default=100.0, help="Padding around segments in ms")
+    parser.add_argument("--analyze", action="store_true", help="Analyze audio for visual feedback on energy levels and segment durations")
     args = parser.parse_args()
 
     audio_path = args.audio
@@ -431,6 +645,12 @@ def main() -> int:
     y, sr = load_audio_mono_float32(audio_path, target_sr=16000)
     duration = len(y) / float(sr)
     print(f"Loaded: {os.path.basename(audio_path)} | {sr} Hz | {duration:.2f}s")
+
+    if args.analyze:
+        print("Analyzing audio…", flush=True)
+        analyze_audio(y, sr, frame_ms=args.frame_ms, hop_ms=args.hop_ms)
+        print("\nDone.")
+        return 0
 
     print("Detecting segments (energy-based)…", flush=True)
     segments = energy_vad(
@@ -558,26 +778,43 @@ def main() -> int:
             if args.no_transcribe or args.backend == "none":
                 print("  -> skipped (no-transcribe)", flush=True)
             elif transcriber is not None and transcriber.available():
-                # Try Hebrew first, then English
+                # Transcribe both Hebrew and English, then choose the best result via a simple heuristic
+                t_he = ""
+                t_en = ""
                 try:
-                    t_he = transcriber.transcribe_wav(seg_wav, language="he")
+                    t_he = transcriber.transcribe_wav(seg_wav, language="he") or ""
                 except Exception as e:
                     t_he = ""
                     warnings.warn(f"Hebrew transcription failed: {e}")
 
-                if t_he and t_he.strip():
-                    transcript = t_he.strip()
-                    lang_used = "he"
-                else:
-                    try:
-                        t_en = transcriber.transcribe_wav(seg_wav, language="en")
-                    except Exception as e:
-                        t_en = ""
-                        warnings.warn(f"English transcription failed: {e}")
+                try:
+                    t_en = transcriber.transcribe_wav(seg_wav, language="en") or ""
+                except Exception as e:
+                    t_en = ""
+                    warnings.warn(f"English transcription failed: {e}")
 
-                    if t_en and t_en.strip():
-                        transcript = t_en.strip()
-                        lang_used = "en"
+                t_he = t_he.strip()
+                t_en = t_en.strip()
+
+                def _score_text(s: str) -> int:
+                    if not s:
+                        return 0
+                    words = len(s.split())
+                    chars = len(s)
+                    return words * 1000 + chars
+
+                # Choose the higher-scoring non-empty transcription; if tie prefer Hebrew
+                score_he = _score_text(t_he)
+                score_en = _score_text(t_en)
+                if score_he == 0 and score_en == 0:
+                    transcript = ""
+                    lang_used = None
+                elif score_he >= score_en:
+                    transcript = t_he
+                    lang_used = "he" if t_he else "en"
+                else:
+                    transcript = t_en
+                    lang_used = "en"
 
             if not args.no_transcribe and transcript:
                 success += 1
