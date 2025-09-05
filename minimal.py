@@ -667,6 +667,45 @@ def render_segment_transcripts_html(segments: List[Dict], texts: List[str]) -> s
     return "\n".join(blocks)
 
 
+def render_audio_player_html(audio_path: Optional[str], start: Optional[float] = None, end: Optional[float] = None, autoplay: bool = False) -> str:
+    if not audio_path:
+        return "<em>No audio loaded</em>"
+    s = 0.0 if start is None else float(start)
+    e = -1.0 if end is None else float(end)
+    auto = 'true' if autoplay else 'false'
+    # Use Gradio's file proxy via 'file=' prefix
+    return f"""
+<div>
+  <audio id="seg-player" src="file={py_html.escape(audio_path)}" controls style="width:100%"></audio>
+  <div style="font-size:0.9rem;color:#555;">Segment: {s:.3f}s → {('∞' if e<0 else f'{e:.3f}s')}</div>
+</div>
+<script>
+(function(){{
+  try {{
+    const a = document.getElementById('seg-player');
+    const s = {s:.3f};
+    const e = {e:.3f};
+    const autoplay = {auto};
+    if (!a) return;
+    if (autoplay) {{
+      a.currentTime = Math.max(0, s - 0.02);
+      a.play().catch(()=>{{}});
+      if (e > 0 && e > s) {{
+        const handler = () => {{
+          if (a.currentTime >= e) {{
+            a.pause();
+            a.removeEventListener('timeupdate', handler);
+          }}
+        }};
+        a.addEventListener('timeupdate', handler);
+      }}
+    }}
+  }} catch(e) {{}}
+}})();
+</script>
+"""
+
+
 def process_audio(audio_path: str, allowed_lang_names: List[str], backend: str = "auto"):
     if not audio_path:
         return "Please upload an audio file.", [], ""
@@ -869,6 +908,7 @@ def build_ui():
                 go = gr.Button("Process segments", variant="primary")
 
         status = gr.Textbox(label="Status", interactive=False)
+        player = gr.HTML(label="Player", value="")
         seg_df = gr.Dataframe(
             headers=["idx", "start", "end", "language", "prob", "text", "probs", "source", "dBFS", "has_words", "has_text", "flags"],
             value=[],
@@ -898,9 +938,24 @@ def build_ui():
 
         def _run(audio_path, lang_names, be):
             s, rows, _html = process_audio(audio_path, lang_names, backend=be)
-            # Pack states: store segments/words/texts and context
-            # For simplicity, recompute via a second call to get internal structures
-            return s, rows, rows, lang_names, audio_path, [], None
+            player_html = render_audio_player_html(audio_path, None, None, autoplay=False)
+            # Initialize states from rows; rows act as our working table
+            return s, player_html, rows, rows, lang_names, audio_path, [], None
+
+        def _on_select(evt, rows, audio_path_v):
+            try:
+                idx = getattr(evt, 'index', None)
+                if not idx:
+                    return gr.update()
+                r, c = idx
+                # Only act when clicking start/end columns
+                if c not in (1, 2):
+                    return gr.update()
+                s_val = float(rows[r][1])
+                e_val = float(rows[r][2])
+                return render_audio_player_html(audio_path_v, s_val, e_val, autoplay=True)
+            except Exception:
+                return gr.update()
 
         def _apply(idx, corr_lang, grade_val, rows, lang_names, audio_path_v, feedback, _bias):
             try:
@@ -1046,7 +1101,8 @@ def build_ui():
                 updated.append(r)
             return updated, updated
 
-        go.click(_run, inputs=[audio, langs, backend], outputs=[status, seg_df, segs_state, allowed_state, audio_path_state, feedback_state, bias_state])
+        go.click(_run, inputs=[audio, langs, backend], outputs=[status, player, seg_df, segs_state, allowed_state, audio_path_state, feedback_state, bias_state])
+        seg_df.select(_on_select, inputs=[seg_df, audio_path_state], outputs=[player])
         apply_btn.click(_apply, inputs=[sel_idx, corrected, grade, segs_state, allowed_state, audio_path_state, feedback_state, bias_state], outputs=[seg_df, segs_state, feedback_state])
         save_btn.click(_save_feedback, inputs=[segs_state, allowed_state, audio_path_state, feedback_state, bias_state], outputs=[status, seg_df, segs_state])
         export_truth_btn.click(_export_truth, inputs=[segs_state, allowed_state, audio_path_state, feedback_state, bias_state], outputs=[status, seg_df, segs_state])
