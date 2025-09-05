@@ -2,3 +2,4 @@ venv
 outputs*
 data/**
 .aider*
+__pycache__
